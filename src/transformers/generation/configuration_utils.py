@@ -276,6 +276,9 @@ class GenerationConfig(PushToHubMixin):
         self.sequence_bias = kwargs.pop("sequence_bias", None)
         self.guidance_scale = kwargs.pop("guidance_scale", None)
         self.low_memory = kwargs.pop("low_memory", None)
+        self.amateur_layer_idx = kwargs.pop("amateur_layer_idx", None)
+        self.cd_alpha = kwargs.pop("cd_alpha", 0.1)
+        self.cd_beta = kwargs.pop("cd_beta", 0.5)
 
         # Parameters that define the output variables of `generate`
         self.num_return_sequences = kwargs.pop("num_return_sequences", 1)
