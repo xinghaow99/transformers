@@ -2484,7 +2484,6 @@ class GenerationMixin:
                 continue  # don't waste resources running the code we don't need
 
             next_token_logits = outputs.logits[:, -1, :]
-
             # pre-process distribution
             next_tokens_scores = logits_processor(input_ids, next_token_logits)
 
@@ -4653,7 +4652,7 @@ class GenerationMixin:
     def layer_wise_contrastive_decoding(
         self,
         input_ids: torch.LongTensor,
-        amateur_layer_idx: int,
+        amateur_layer_idx: Union[int, str],
         cd_alpha: float = 0.1,
         cd_beta: float = 0.5,
         logits_processor: Optional[LogitsProcessorList] = None,
@@ -4671,7 +4670,9 @@ class GenerationMixin:
         **model_kwargs,
     ) -> Union[GreedySearchOutput, torch.LongTensor]:
         
-        # print("Running layer wise contrasitve decoding")
+        if isinstance(amateur_layer_idx, str):
+            supported_methods = ["auto", "auto_refine", "bayesian", "auto_refine_log"]
+            assert amateur_layer_idx in supported_methods, "amateur_layer_idx must be an integer or in {}".format(supported_methods)
         # init values
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
@@ -4766,23 +4767,193 @@ class GenerationMixin:
                         output_hidden_states=True,
                         use_cache=True,
                     )
-            expert_logits = model_outputs.logits[:, -1, :]
-            if self.config.is_encoder_decoder:
-                amateur_layer_hidden_states = model_outputs.decoder_hidden_states[amateur_layer_idx]
-            else:
-                amateur_layer_hidden_states = model_outputs.hidden_states[amateur_layer_idx]
+            def get_layer_entropy(layer_prob, eps=1e-9):
+                eps = 1e-9
+                mask = layer_prob > eps
+                layer_entropy = -torch.sum(layer_prob * torch.where(mask, torch.log(layer_prob), layer_prob.new_zeros(1)), dim=-1)
+                return layer_entropy
             
-            amateur_logits = self.lm_head(amateur_layer_hidden_states[:, -1, :])
-            if amateur_logits.device != expert_logits.device:
-                amateur_logits = amateur_logits.to(expert_logits.device)
-            # contrastive
-            cutoff = torch.log(cd_alpha*torch.ones_like(expert_logits)) + expert_logits.max(dim=-1, keepdim=True).values
-            diffs = (1 + cd_beta)*expert_logits - cd_beta*amateur_logits
-            cd_logits = diffs.masked_fill(expert_logits < cutoff, -float('inf'))
-            same_pred_mask = torch.argmax(expert_logits, dim=-1, keepdim=True) == torch.argmax(amateur_logits, dim=-1, keepdim=True)
-            same_pred_mask = same_pred_mask.expand_as(expert_logits)
-            cd_logits = torch.where(same_pred_mask, expert_logits, cd_logits)
+            def get_layer_entropy_log(layer_log_prob):
+                layer_entropy = -torch.nansum(layer_log_prob.exp() * layer_log_prob, dim=-1)
+                return layer_entropy
+
+            def get_min_entropy_logits(hidden_states):
+                stacked_hidden_states = torch.stack(hidden_states, dim=0) # (num_layers, batch_size, seq_len, hidden_size)
+                layer_logits = self.lm_head(stacked_hidden_states[:, :, -1, :]) # (num_layers, batch_size, vocab_size)
+                layer_prob = torch.softmax(layer_logits, dim=-1) # (num_layers, batch_size, vocab_size)
+                # layer_entropy = -torch.sum(layer_prob * torch.log(layer_prob+1e-9), dim=-1) # (num_layers, batch_size)
+                layer_entropy = get_layer_entropy(layer_prob)
+                min_entropy_layer = torch.argmin(layer_entropy, dim=0)
+                batch_indices = torch.arange(stacked_hidden_states.size(1))
+                min_entropy_logits = layer_logits[min_entropy_layer, batch_indices]
+
+                return min_entropy_logits
+            def get_min_entropy_layer(hidden_states):
+                stacked_hidden_states = torch.stack(hidden_states, dim=0)
+                layer_logits = self.lm_head(stacked_hidden_states[:, :, -1, :])
+                layer_prob = torch.softmax(layer_logits, dim=-1)
+                # layer_entropy = -torch.sum(layer_prob * torch.log(layer_prob+1e-9), dim=-1) # (num_layers, batch_size)
+                layer_entropy = get_layer_entropy(layer_prob)
+                min_entropy_layer = torch.argmin(layer_entropy, dim=0)
+                return min_entropy_layer
+
+            def get_min_entropy_diff_layer_window(layer_prob, window_size=3):
+                # layer_entropy = -torch.sum(layer_prob * torch.log(layer_prob+1e-9), dim=-1) # (num_layers, batch_size)
+                layer_entropy = get_layer_entropy(layer_prob)
+                entropy_diff = torch.diff(layer_entropy, dim=0) # (num_layers-1, batch_size)
+                entropy_diff = entropy_diff.transpose(0, 1).unsqueeze(1) # (batch_size, 1, num_layers-1)
+                weights = torch.ones(1, 1, window_size, dtype=entropy_diff.dtype,device=entropy_diff.device) / window_size
+                moving_average = torch.nn.functional.conv1d(entropy_diff, weights, padding=window_size-1)[:, :, window_size-1:].squeeze(1) # (batch_size, num_layers)
+                start_layer = moving_average.argmin(dim=-1) + 1
+                return start_layer
+            
+            def get_min_entropy_diff_layer(layer_prob):
+                # layer_entropy = -torch.sum(layer_prob * torch.log(layer_prob+1e-9), dim=-1) # (num_layers, batch_size)
+                layer_entropy = get_layer_entropy(layer_prob)
+                entropy_diff = torch.diff(layer_entropy, dim=0).transpose(0, 1) # (batch_size, num_layers-1)
+                # entropy_diff = entropy_diff.transpose(0, 1) # (batch_size, num_layers-1)
+                start_layer = entropy_diff.argmin(dim=-1) + 1
+                return start_layer
+            
+            @torch.no_grad()
+            def compute_and_refine_distribution(hidden_states, beta=0.9, alpha=0.5):
+                layer_prob = torch.stack([self.lm_head(layer_hidden_states[:, -1, :]) for layer_hidden_states in hidden_states], dim=0).softmax(dim=-1, dtype=torch.float32)
+                # stacked_hidden_states = torch.stack([self.model.norm(layer_hidden_states[:, -1, :]) for layer_hidden_states in hidden_states[:-1]] + [hidden_states[-1][:, -1, :]], dim=0)
+                # stacked_hidden_states = self.model.norm(stacked_hidden_states)
+                # layer_logits = self.lm_head(stacked_hidden_states)
+                # layer_prob = torch.softmax(layer_logits, dim=-1)
+                # refine_start_layer_idx = get_min_entropy_diff_layer_window(layer_prob)
+                refine_start_layer_idx = get_min_entropy_diff_layer(layer_prob)
+                # print("start_layers:", refine_start_layer_idx)
+                # refine_start_layer_idx = torch.zeros_like(refine_start_layer_idx, device=refine_start_layer_idx.device)
+                # Assumption: prob_list is a list of tensors where each tensor has shape (batch_size, vocab_size)
+                num_layers = layer_prob.size(0)
+                momentum = torch.zeros_like(layer_prob[-1])
+                # refine_start_layer_idx = torch.zeros_like(refine_start_layer_idx, device=refine_start_layer_idx.device) + num_layers - 15
+
+                for t in range(1, num_layers):
+                    delta_p = layer_prob[t] - layer_prob[t-1]
+                    # delta_p = torch.nn.functional.log_softmax(layer_logits[t], dim=-1) - torch.nn.functional.log_softmax(layer_logits[t-1], dim=-1)
+                    # Create a mask where for each batch, set values from min_entropy_layer to end as True
+                    mask = (torch.arange(num_layers, device=layer_prob.device).unsqueeze(0) >= refine_start_layer_idx.unsqueeze(1))
+                    
+                    # Update momentum using the mask
+                    expanded_mask = mask[:, t].unsqueeze(-1).expand_as(momentum)
+                    momentum = torch.where(expanded_mask, beta * momentum + (1 - beta) * delta_p, momentum)
+
+                # weight_factor = (num_layers - refine_start_layer_idx.float()) / num_layers
+                # alpha = alpha * weight_factor.unsqueeze(-1).expand_as(layer_prob[-1])
+
+                # Element-wise weighted average of last layer probability and momentum for each batch
+                # refined = alpha * layer_prob[-1] + 2*(1 - weight_factor.unsqueeze(-1).expand_as(layer_prob[-1])) * momentum
+                refined = layer_prob[-1] + alpha * momentum
+                # refined = momentum
+                # refined = layer_prob[-1] + alpha * (1 - weight_factor.unsqueeze(-1).expand_as(layer_prob[-1])) * momentum
+                # refined = alpha * layer_prob[-1] + (1 - alpha) * momentum
+                
+                return refined
+            
+            @torch.no_grad()
+            def refine_log_prob(hidden_states, alpha=0.5, beta=0.9):
+                layer_logits = torch.stack([self.lm_head(layer_hidden_states[:, -1, :]) for layer_hidden_states in hidden_states], dim=0)
+                layer_log_prob = torch.nn.functional.log_softmax(layer_logits, dim=-1)
+
+                layer_entropy = get_layer_entropy_log(layer_log_prob)
+                entropy_diff = torch.diff(layer_entropy, dim=0) # (num_layers-1, batch_size)
+                entropy_diff = entropy_diff.transpose(0, 1) # (batch_size, num_layers-1)
+                refine_start_layer_idx = entropy_diff.argmin(dim=-1) + 1
+
+                num_layers = layer_log_prob.size(0)
+                momentum = torch.zeros_like(layer_log_prob[-1], device=layer_log_prob.device)
+                
+                for t in range(1, num_layers):
+                    logprob_max = torch.max(layer_log_prob[t], layer_log_prob[t-1])
+                    delta_p = (torch.exp(layer_log_prob[t] - logprob_max) - torch.exp(layer_log_prob[t-1] - logprob_max)) * torch.exp(logprob_max)
+                    
+                    # Create a mask where for each batch, set values from min_entropy_layer to end as True
+                    mask = (torch.arange(num_layers, device=layer_log_prob.device).unsqueeze(0) >= refine_start_layer_idx.unsqueeze(1))
+                    
+                    # Update momentum using the mask
+                    expanded_mask = mask[:, t].unsqueeze(-1).expand_as(momentum)
+                    momentum = torch.where(expanded_mask, beta * momentum + (1 - beta) * delta_p, momentum)
+
+                # weight_factor = (num_layers - refine_start_layer_idx.float()) / num_layers
+                # refined = layer_log_prob[-1] + alpha * (1 - weight_factor.unsqueeze(-1).expand_as(layer_log_prob[-1])) * momentum
+                refined = layer_log_prob[-1].exp() + alpha * momentum
+                return refined
+            @torch.no_grad()
+            def bayesian_update(hidden_states):
+                # stacked_hidden_states = torch.stack([layer_hidden_states[:, -1, :] for layer_hidden_states in hidden_states], dim=0)
+                # layer_logits = self.lm_head(stacked_hidden_states)
+                # layer_probs = torch.softmax(layer_logits, dim=-1)
+                # start_layers = get_min_entropy_diff_layer(layer_probs)
+                # print(hidden_states[-1])
+                stacked_hidden_states = torch.stack(hidden_states, dim=0)
+                # print("stacked_hidden_states has nan:", torch.isnan(stacked_hidden_states).any())
+                # print(stacked_hidden_states[-1])
+                layer_logits = self.lm_head(stacked_hidden_states[:, :, -1, :])
+                layer_probs = torch.softmax(layer_logits, dim=-1)
+                start_layers = get_min_entropy_diff_layer_window(layer_probs)
+                print("start_layers:", start_layers)
+                # print("layer_logits has nan:", torch.isnan(layer_logits).any())
+                # prior = layer_probs[start_layer]
+                # for i in range(start_layer, layer_probs.size(0)):
+                #     layer_prob = layer_probs[i]
+                #     unnormalized_posterior = layer_prob * prior
+                #     posterior = unnormalized_posterior / unnormalized_posterior.sum()
+                #     prior = posterior
+                
+                num_layers, batch_size, vocab_size = layer_probs.shape
+                prior = layer_probs.gather(0, start_layers.view(1, -1, 1).expand(num_layers, -1, vocab_size))[0]
+                epsilon = torch.finfo(layer_probs.dtype).tiny
+
+                # Batched processing through layers
+                for i in range(num_layers):
+                    # Create a mask for examples that need to be processed at this layer
+                    mask = (i >= start_layers).view(-1, 1).expand(-1, vocab_size).to(layer_probs.dtype)
+                    
+                    # Select the layer_probs for the current layer
+                    layer_prob = layer_probs[i]
+                    # print("prior has nan:", torch.isnan(prior).any())
+                    # print("layer_prob has nan:", torch.isnan(layer_prob).any())
+                    # Compute the unnormalized posterior only for the examples that are being processed at this layer
+                    unnormalized_posterior = layer_prob * prior * mask
+                    # print("unnormalized_posterior has nan:", torch.isnan(unnormalized_posterior).any())
+
+                    posterior = unnormalized_posterior / (unnormalized_posterior.sum(dim=-1, keepdim=True) + epsilon)
+                    # print("posterior:", posterior)
+                    # print("posterior has nan:", torch.isnan(posterior).any())
+                    # Update the prior only for the examples that are being processed at this layer
+                    prior = prior * (1 - mask) + posterior * mask
+
+                return posterior
+
+            hidden_states = model_outputs.decoder_hidden_states if self.config.is_encoder_decoder else model_outputs.hidden_states
+            expert_logits = model_outputs.logits[:, -1, :]
+            if isinstance(amateur_layer_idx, int):
+                amateur_logits = self.lm_head(hidden_states[amateur_layer_idx][:, -1, :])
+            elif amateur_layer_idx == "auto":
+                amateur_logits = get_min_entropy_logits(hidden_states)
+            elif amateur_layer_idx == "auto_refine":
+                cd_logits = compute_and_refine_distribution(hidden_states, alpha=cd_alpha, beta=cd_beta)
+            elif amateur_layer_idx == "bayesian":
+                cd_logits = bayesian_update(hidden_states)
+            elif amateur_layer_idx == "auto_refine_log":
+                cd_logits = refine_log_prob(hidden_states, alpha=cd_alpha, beta=cd_beta)
+            else:
+                if amateur_logits.device != expert_logits.device:
+                    amateur_logits = amateur_logits.to(expert_logits.device)
+                # contrastive
+                cutoff = torch.log(cd_alpha*torch.ones_like(expert_logits)) + expert_logits.max(dim=-1, keepdim=True).values
+                diffs = (1 + cd_beta)*expert_logits - cd_beta*amateur_logits
+                cd_logits = diffs.masked_fill(expert_logits < cutoff, -float('inf'))
+            # same_pred_mask = torch.argmax(expert_logits, dim=-1, keepdim=True) == torch.argmax(amateur_logits, dim=-1, keepdim=True)
+            # same_pred_mask = same_pred_mask.expand_as(expert_logits)
+            # cd_logits = torch.where(same_pred_mask, expert_logits, cd_logits)
+
+            
             # pre-process distribution
+            cd_logits = cd_logits.to(input_ids.device)
             cd_logits = logits_processor(input_ids, cd_logits)
             cd_logits = logits_warper(input_ids, cd_logits)
 
@@ -4792,6 +4963,7 @@ class GenerationMixin:
             # else:
                 # next_tokens = torch.argmax(cd_logits, dim=-1)
             next_tokens = torch.argmax(cd_logits, dim=-1)
+            next_tokens = next_tokens.to(input_ids.device)
             # finished sentences should have their next token be a padding token
             if eos_token_id is not None:
                 if pad_token_id is None:
