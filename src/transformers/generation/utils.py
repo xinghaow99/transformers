@@ -4671,7 +4671,7 @@ class GenerationMixin:
     ) -> Union[GreedySearchOutput, torch.LongTensor]:
         
         if isinstance(amateur_layer_idx, str):
-            supported_methods = ["auto", "auto_refine", "bayesian", "auto_refine_log"]
+            supported_methods = ["auto", "refine", "bayesian", "auto_refine_log", "refine_hidden", "refine_norm"]
             assert amateur_layer_idx in supported_methods, "amateur_layer_idx must be an integer or in {}".format(supported_methods)
         # init values
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
@@ -4823,7 +4823,8 @@ class GenerationMixin:
                 # layer_logits = self.lm_head(stacked_hidden_states)
                 # layer_prob = torch.softmax(layer_logits, dim=-1)
                 # refine_start_layer_idx = get_min_entropy_diff_layer_window(layer_prob)
-                refine_start_layer_idx = get_min_entropy_diff_layer(layer_prob)
+                # refine_start_layer_idx = get_min_entropy_diff_layer(layer_prob)
+                refine_start_layer_idx = get_min_entropy_diff_layer_window(layer_prob)
                 # print("start_layers:", refine_start_layer_idx)
                 # refine_start_layer_idx = torch.zeros_like(refine_start_layer_idx, device=refine_start_layer_idx.device)
                 # Assumption: prob_list is a list of tensors where each tensor has shape (batch_size, vocab_size)
@@ -4852,7 +4853,59 @@ class GenerationMixin:
                 # refined = alpha * layer_prob[-1] + (1 - alpha) * momentum
                 
                 return refined
+
+            @torch.no_grad()
+            def refine_hidden(hidden_states, beta=0.9, alpha=0.5):
+                layer_prob = torch.stack([self.lm_head(layer_hidden_states[:, -1, :]) for layer_hidden_states in hidden_states], dim=0).softmax(dim=-1, dtype=torch.float32)
+                layer_hidden = torch.stack([layer_hidden_states[:, -1, :] for layer_hidden_states in hidden_states], dim=0)
+                refine_start_layer_idx = get_min_entropy_diff_layer_window(layer_prob)
+
+                num_layers = layer_prob.size(0)
+                momentum = torch.zeros_like(layer_hidden[-1])
+
+
+                for t in range(1, num_layers):
+
+                    delta_hidden = layer_hidden[t] - layer_hidden[t-1]
+                    # Create a mask where for each batch, set values from min_entropy_layer to end as True
+                    mask = (torch.arange(num_layers, device=layer_hidden.device).unsqueeze(0) >= refine_start_layer_idx.unsqueeze(1))
+                    
+                    # Update momentum using the mask
+                    expanded_mask = mask[:, t].unsqueeze(-1).expand_as(momentum)
+                    momentum = torch.where(expanded_mask, beta * momentum + (1 - beta) * delta_hidden, momentum)
+
+                refined_hidden = layer_hidden[-1] + alpha * momentum
+                refined_logits = self.lm_head(refined_hidden)
+                return refined_logits
             
+            @torch.no_grad()
+            def refine_norm(hidden_states, beta=0.9, alpha=0.5):
+                layer_prob = torch.stack([self.lm_head(layer_hidden_states[:, -1, :]) for layer_hidden_states in hidden_states], dim=0).softmax(dim=-1, dtype=torch.float32)
+                refine_start_layer_idx = get_min_entropy_diff_layer_window(layer_prob)
+
+                num_layers = layer_prob.size(0)
+                momentum = torch.zeros_like(layer_prob[-1])
+
+
+                for t in range(1, num_layers):
+                    delta_p = layer_prob[t] - layer_prob[t-1]
+                    # Create a mask where for each batch, set values from min_entropy_layer to end as True
+                    mask = (torch.arange(num_layers, device=layer_prob.device).unsqueeze(0) >= refine_start_layer_idx.unsqueeze(1))
+                    
+                    # Update momentum using the mask
+                    expanded_mask = mask[:, t].unsqueeze(-1).expand_as(momentum)
+                    momentum = torch.where(expanded_mask, beta * momentum + (1 - beta) * delta_p, momentum)
+                    # Normalize
+                    # mean = momentum.mean(dim=-1, keepdim=True)
+                    # std = momentum.std(dim=-1, keepdim=True)
+                    # momentum = (momentum - mean) / std
+                    # momentum = momentum / momentum.norm(dim=-1, keepdim=True)
+                momentum += momentum.min(dim=-1, keepdim=True)[0]
+                momentum = momentum / momentum.sum(dim=-1, keepdim=True)
+                refined = layer_prob[-1] + alpha * momentum
+
+                
+                return refined
             @torch.no_grad()
             def refine_log_prob(hidden_states, alpha=0.5, beta=0.9):
                 layer_logits = torch.stack([self.lm_head(layer_hidden_states[:, -1, :]) for layer_hidden_states in hidden_states], dim=0)
@@ -4934,12 +4987,16 @@ class GenerationMixin:
                 amateur_logits = self.lm_head(hidden_states[amateur_layer_idx][:, -1, :])
             elif amateur_layer_idx == "auto":
                 amateur_logits = get_min_entropy_logits(hidden_states)
-            elif amateur_layer_idx == "auto_refine":
+            elif amateur_layer_idx == "refine":
                 cd_logits = compute_and_refine_distribution(hidden_states, alpha=cd_alpha, beta=cd_beta)
             elif amateur_layer_idx == "bayesian":
                 cd_logits = bayesian_update(hidden_states)
             elif amateur_layer_idx == "auto_refine_log":
                 cd_logits = refine_log_prob(hidden_states, alpha=cd_alpha, beta=cd_beta)
+            elif amateur_layer_idx == "refine_hidden":
+                cd_logits = refine_hidden(hidden_states, alpha=cd_alpha, beta=cd_beta)
+            elif amateur_layer_idx == "refine_norm":
+                cd_logits = refine_norm(hidden_states, alpha=cd_alpha, beta=cd_beta)
             else:
                 if amateur_logits.device != expert_logits.device:
                     amateur_logits = amateur_logits.to(expert_logits.device)
